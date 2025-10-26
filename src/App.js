@@ -1,247 +1,372 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import io from "socket.io-client";
 import Peer from "simple-peer";
 import ReactPlayer from "react-player";
 
-SIGNALING_SERVER = process.env.REACT_APP_SIGNALING_SERVER || "https://webrtc-server-wwai.onrender.com";
+// Config: env first, fallback to your Render server
+const SIGNALING_SERVER =
+  process.env.REACT_APP_SIGNALING_SERVER ||
+  "https://webrtc-server-wwai.onrender.com";
+
 export default function App() {
+  // Identity / room
   const [name, setName] = useState("");
+  const [roomId, setRoomId] = useState("default-room"); // set via UI for prod
   const [myId, setMyId] = useState("");
-  const [peers, setPeers] = useState({});
+
+  // Roles and media
   const [isHost, setIsHost] = useState(false);
   const [stream, setStream] = useState(null);
+
+  // WebRTC peers map: { [peerId]: { peer, stream } }
+  const [peers, setPeers] = useState({});
+
+  // Shared media
   const [videoUrl, setVideoUrl] = useState("");
   const [sharedVideoUrl, setSharedVideoUrl] = useState("");
+
+  // Chat
   const [chatMessages, setChatMessages] = useState([]);
   const [chatInput, setChatInput] = useState("");
 
-  const socketRef = useRef();
-  const peersRef = useRef({});
-  const myVideo = useRef();
+  // Refs
+  const socketRef = useRef(null);
+  const peersRef = useRef({}); // { [peerId]: { peer } }
+  const myVideoRef = useRef(null);
+  const playerRef = useRef(null);
 
-  // 🔹 1. Initialize socket and media
+  // Init media (one-time)
   useEffect(() => {
-    socketRef.current = io(SIGNALING_SERVER, { transports: ["websocket"] });
-
+    let isMounted = true;
     navigator.mediaDevices
       .getUserMedia({ video: true, audio: true })
       .then((mediaStream) => {
+        if (!isMounted) return;
         setStream(mediaStream);
-        if (myVideo.current) myVideo.current.srcObject = mediaStream;
+        if (myVideoRef.current) {
+          myVideoRef.current.srcObject = mediaStream;
+        }
       })
-      .catch((err) => console.error("Media access error:", err));
-
-    socketRef.current.on("connect", () => {
-      setMyId(socketRef.current.id);
-      console.log("Connected:", socketRef.current.id);
-    });
-
-    socketRef.current.on("host-assigned", () => setIsHost(true));
-
-    socketRef.current.on("user-joined", (payload) => {
-      const peer = createPeer(payload.userId, socketRef.current.id, stream);
-      peersRef.current[payload.userId] = peer;
-      setPeers((prev) => ({ ...prev, [payload.userId]: { peer } }));
-    });
-
-    socketRef.current.on("receiving-returned-signal", (payload) => {
-      const peerObj = peersRef.current[payload.id];
-      if (peerObj) peerObj.signal(payload.signal);
-    });
-
-    socketRef.current.on("receive-message", ({ name, message }) => {
-      setChatMessages((prev) => [...prev, { name, message }]);
-    });
-
-    socketRef.current.on("receive-video", (url) => {
-      setSharedVideoUrl(url);
-    });
-
-    socketRef.current.on("user-disconnected", (id) => {
-      if (peersRef.current[id]) {
-        peersRef.current[id].destroy();
-        delete peersRef.current[id];
-        setPeers((prev) => {
-          const updated = { ...prev };
-          delete updated[id];
-          return updated;
-        });
-      }
-    });
-
+      .catch((err) => {
+        console.error("Media access error:", err);
+      });
     return () => {
-      socketRef.current.disconnect();
-      Object.values(peersRef.current).forEach((p) => p.destroy());
+      isMounted = false;
     };
-  }, [stream]);
+  }, []);
 
-  // 🔹 2. Create Peer connection
-  function createPeer(userToSignal, callerId, stream) {
+  // Helper: add peer to state and refs consistently
+  const registerPeer = useCallback((peerId, peer) => {
+    peersRef.current[peerId] = { peer };
+    setPeers((prev) => ({
+      ...prev,
+      [peerId]: { peer },
+    }));
+  }, []);
+
+  // Helper: update remote stream in state
+  const setRemoteStream = useCallback((peerId, remoteStream) => {
+    setPeers((prev) => ({
+      ...prev,
+      [peerId]: { ...(prev[peerId] || {}), stream: remoteStream },
+    }));
+  }, []);
+
+  // Create peer (initiator)
+  const createPeer = useCallback((userToSignal, callerId, mediaStream) => {
     const peer = new Peer({
       initiator: true,
       trickle: false,
-      stream,
+      stream: mediaStream || undefined,
     });
 
     peer.on("signal", (signal) => {
-      socketRef.current.emit("sending-signal", { userToSignal, callerId, signal });
+      socketRef.current?.emit("sending-signal", {
+        roomId,
+        userToSignal,
+        callerId,
+        signal,
+      });
     });
 
     peer.on("stream", (remoteStream) => {
-      setPeers((prev) => ({
-        ...prev,
-        [userToSignal]: { ...prev[userToSignal], stream: remoteStream },
-      }));
+      setRemoteStream(userToSignal, remoteStream);
     });
 
+    peer.on("error", (e) => console.warn("Peer error (initiator):", e));
     return peer;
-  }
+  }, [roomId, setRemoteStream]);
 
-  // 🔹 3. Handle return signal
-  function addPeer(incomingSignal, callerId, stream) {
+  // Add peer (receiver)
+  const addPeer = useCallback((incomingSignal, callerId, mediaStream) => {
     const peer = new Peer({
       initiator: false,
       trickle: false,
-      stream,
+      stream: mediaStream || undefined,
     });
 
     peer.on("signal", (signal) => {
-      socketRef.current.emit("returning-signal", { signal, callerId });
+      socketRef.current?.emit("returning-signal", {
+        roomId,
+        signal,
+        callerId,
+      });
     });
 
     peer.on("stream", (remoteStream) => {
-      setPeers((prev) => ({
-        ...prev,
-        [callerId]: { ...prev[callerId], stream: remoteStream },
-      }));
+      setRemoteStream(callerId, remoteStream);
     });
 
+    peer.on("error", (e) => console.warn("Peer error (receiver):", e));
     peer.signal(incomingSignal);
     return peer;
-  }
+  }, [roomId, setRemoteStream]);
 
-  // 🔹 4. Chat system
+  // Init socket and all listeners (one-time)
+  useEffect(() => {
+    if (!SIGNALING_SERVER) {
+      console.error("SIGNALING_SERVER missing");
+      return;
+    }
+    const socket = io(SIGNALING_SERVER, { transports: ["websocket"] });
+    socketRef.current = socket;
+
+    socket.on("connect", () => {
+      setMyId(socket.id);
+      // Join a room with a name; server should assign host to first socket in room
+      socket.emit("join-room", { roomId, name: name || `User-${socket.id.slice(0, 5)}` });
+    });
+
+    socket.on("host-assigned", () => {
+      setIsHost(true);
+    });
+
+    // Server sends current peers when joining
+    socket.on("room-peers", ({ peers: existingPeers }) => {
+      if (!stream) return; // wait for media, server may re-emit or client can request again
+      existingPeers.forEach((peerId) => {
+        const peer = createPeer(peerId, socket.id, stream);
+        registerPeer(peerId, peer);
+      });
+    });
+
+    // New user joined -> existing users should initiate to them
+    socket.on("user-joined", ({ userId }) => {
+      if (!stream) return;
+      // Initiate connection towards newcomer
+      const peer = createPeer(userId, socket.id, stream);
+      registerPeer(userId, peer);
+    });
+
+    // Newcomer receives initiator’s signal
+    socket.on("receiving-signal", ({ callerId, signal }) => {
+      if (!stream) return;
+      const peer = addPeer(signal, callerId, stream);
+      registerPeer(callerId, peer);
+    });
+
+    // Initiator receives callee’s answer
+    socket.on("receiving-returned-signal", ({ id, signal }) => {
+      const entry = peersRef.current[id];
+      entry?.peer?.signal(signal);
+    });
+
+    // Chat
+    socket.on("receive-message", ({ name: from, message }) => {
+      setChatMessages((prev) => [...prev, { name: from, message }]);
+    });
+
+    // Shared video URL (host-originated)
+    socket.on("receive-video", ({ url }) => {
+      setSharedVideoUrl(url);
+    });
+
+    // Player control sync (optional extension)
+    socket.on("player-control", ({ action, time }) => {
+      const player = playerRef.current;
+      if (!player) return;
+      if (action === "PLAY") player.getInternalPlayer && player.seekTo(time, "seconds");
+      if (action === "PLAY") player.getInternalPlayer && player.getInternalPlayer().play?.();
+      if (action === "PAUSE") {
+        player.getInternalPlayer && player.seekTo(time, "seconds");
+        player.getInternalPlayer && player.getInternalPlayer().pause?.();
+      }
+      if (action === "SEEK") player.getInternalPlayer && player.seekTo(time, "seconds");
+    });
+
+    // Peer cleanup
+    socket.on("user-left", ({ userId }) => {
+      const entry = peersRef.current[userId];
+      if (entry) {
+        entry.peer.destroy();
+        delete peersRef.current[userId];
+      }
+      setPeers((prev) => {
+        const next = { ...prev };
+        delete next[userId];
+        return next;
+      });
+    });
+
+    return () => {
+      socket.disconnect();
+      Object.values(peersRef.current).forEach(({ peer }) => peer.destroy());
+      peersRef.current = {};
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [createPeer, addPeer, registerPeer, roomId, name, stream]);
+
+  // Attach local stream to <video> when available
+  useEffect(() => {
+    if (myVideoRef.current && stream) {
+      myVideoRef.current.srcObject = stream;
+    }
+  }, [stream]);
+
+  // Chat send
   const sendMessage = () => {
-    if (chatInput.trim()) {
-      socketRef.current.emit("send-message", { name, message: chatInput });
-      setChatMessages((prev) => [...prev, { name: "You", message: chatInput }]);
-      setChatInput("");
-    }
+    const msg = chatInput.trim();
+    if (!msg) return;
+    socketRef.current?.emit("send-message", { roomId, name: name || myId, message: msg });
+    setChatMessages((prev) => [...prev, { name: "You", message: msg }]);
+    setChatInput("");
   };
 
-  // 🔹 5. Share video
+  // Share video (host only)
   const shareVideo = () => {
-    if (isHost && videoUrl.trim()) {
-      socketRef.current.emit("share-video", videoUrl);
-      setSharedVideoUrl(videoUrl);
-      setVideoUrl("");
-    }
+    const url = videoUrl.trim();
+    if (!isHost || !url) return;
+    socketRef.current?.emit("share-video", { roomId, url });
+    setSharedVideoUrl(url);
+    setVideoUrl("");
   };
 
+  // Player control helpers (host origin only; guard to avoid echo)
+  const emitPlayerControl = (action, time) => {
+    if (!isHost) return;
+    socketRef.current?.emit("player-control", { roomId, action, time });
+  };
+
+  const onPlay = () => {
+    if (!playerRef.current) return;
+    const t = playerRef.current.getCurrentTime
+      ? playerRef.current.getCurrentTime()
+      : 0;
+    emitPlayerControl("PLAY", t);
+  };
+
+  const onPause = () => {
+    if (!playerRef.current) return;
+    const t = playerRef.current.getCurrentTime
+      ? playerRef.current.getCurrentTime()
+      : 0;
+    emitPlayerControl("PAUSE", t);
+  };
+
+  const onSeek = (t) => {
+    emitPlayerControl("SEEK", t.playedSeconds ?? t);
+  };
+
+  // UI
   return (
-    <div className="p-4 flex flex-col gap-4 bg-gray-900 text-white min-h-screen">
-      {!name ? (
-        <div className="flex flex-col items-center justify-center h-screen">
+    <div style={{ display: "flex", gap: 16, padding: 16 }}>
+      <div style={{ flex: 2, minWidth: 0 }}>
+        <div style={{ marginBottom: 8 }}>
           <input
-            placeholder="Enter your name"
-            className="p-3 text-black rounded-lg mb-4"
+            placeholder="Your name"
             value={name}
             onChange={(e) => setName(e.target.value)}
+            style={{ marginRight: 8 }}
           />
-          <button
-            onClick={() => {
-              if (name.trim()) socketRef.current.emit("set-name", name);
-            }}
-            className="px-6 py-3 bg-blue-600 rounded-lg hover:bg-blue-700"
-          >
-            Join Room
+          <input
+            placeholder="Room ID"
+            value={roomId}
+            onChange={(e) => setRoomId(e.target.value)}
+            style={{ marginRight: 8 }}
+          />
+          <span>{isHost ? "Host" : "Participant"}</span>
+        </div>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          <video
+            ref={myVideoRef}
+            autoPlay
+            playsInline
+            muted
+            style={{ width: 240, background: "#000", borderRadius: 8 }}
+          />
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {Object.entries(peers).map(([pid, p]) => (
+              <video
+                key={pid}
+                autoPlay
+                playsInline
+                ref={(el) => {
+                  if (el && p.stream && el.srcObject !== p.stream) {
+                    el.srcObject = p.stream;
+                  }
+                }}
+                style={{ width: 240, background: "#000", borderRadius: 8 }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div style={{ marginTop: 16 }}>
+          <input
+            placeholder="Paste YouTube/URL to share (host only)"
+            value={videoUrl}
+            onChange={(e) => setVideoUrl(e.target.value)}
+            style={{ width: "70%", marginRight: 8 }}
+          />
+          <button onClick={shareVideo} disabled={!isHost}>
+            Share
           </button>
         </div>
-      ) : (
-        <>
-          <h1 className="text-2xl font-semibold">
-            Welcome, {name} {isHost && "(Host)"}
-          </h1>
 
-          <div className="flex gap-4">
-            {/* My video */}
-            <video
-              ref={myVideo}
-              muted
-              autoPlay
-              playsInline
-              className="rounded-lg w-1/3 border border-gray-700"
+        {sharedVideoUrl && (
+          <div style={{ marginTop: 12 }}>
+            <ReactPlayer
+              ref={playerRef}
+              url={sharedVideoUrl}
+              controls
+              playing={false}
+              width="100%"
+              onPlay={onPlay}
+              onPause={onPause}
+              onSeek={onSeek}
             />
-
-            {/* Remote videos */}
-            {Object.entries(peers).map(([id, { stream }]) =>
-              stream ? (
-                <video
-                  key={id}
-                  autoPlay
-                  playsInline
-                  ref={(video) => {
-                    if (video) video.srcObject = stream;
-                  }}
-                  className="rounded-lg w-1/3 border border-gray-700"
-                />
-              ) : null
-            )}
           </div>
+        )}
+      </div>
 
-          {/* Shared Video */}
-          {sharedVideoUrl && (
-            <div className="mt-6">
-              <ReactPlayer url={sharedVideoUrl} controls playing width="100%" />
+      <div style={{ flex: 1, minWidth: 280 }}>
+        <div
+          style={{
+            height: 420,
+            border: "1px solid #ddd",
+            borderRadius: 8,
+            padding: 8,
+            overflowY: "auto",
+            marginBottom: 8,
+          }}
+        >
+          {chatMessages.map((m, idx) => (
+            <div key={idx} style={{ marginBottom: 6 }}>
+              <strong>{m.name}:</strong> {m.message}
             </div>
-          )}
-
-          {/* Share video (Host only) */}
-          {isHost && (
-            <div className="flex mt-4 gap-2">
-              <input
-                type="text"
-                placeholder="Enter video link (mp4 or YouTube)"
-                value={videoUrl}
-                onChange={(e) => setVideoUrl(e.target.value)}
-                className="p-3 text-black rounded-lg w-full"
-              />
-              <button
-                onClick={shareVideo}
-                className="bg-green-600 px-4 py-2 rounded-lg hover:bg-green-700"
-              >
-                Share
-              </button>
-            </div>
-          )}
-
-          {/* Chat */}
-          <div className="mt-4 bg-gray-800 p-4 rounded-lg w-1/2">
-            <div className="h-48 overflow-y-auto border-b border-gray-700 mb-3">
-              {chatMessages.map((m, i) => (
-                <div key={i}>
-                  <strong>{m.name}:</strong> {m.message}
-                </div>
-              ))}
-            </div>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                placeholder="Type message..."
-                className="p-2 text-black rounded-lg flex-1"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-              />
-              <button
-                onClick={sendMessage}
-                className="bg-blue-600 px-4 py-2 rounded-lg hover:bg-blue-700"
-              >
-                Send
-              </button>
-            </div>
-          </div>
-        </>
-      )}
+          ))}
+        </div>
+        <div>
+          <input
+            placeholder="Type a message"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            style={{ width: "70%", marginRight: 8 }}
+          />
+          <button onClick={sendMessage}>Send</button>
+        </div>
+      </div>
     </div>
   );
 }
