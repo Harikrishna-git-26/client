@@ -3,8 +3,7 @@ import io from "socket.io-client";
 import Peer from "simple-peer";
 import ReactPlayer from "react-player";
 
-REACT_APP_SIGNALING_SERVER = "https://webrtc-server-wwai.onrender.com";
-
+SIGNALING_SERVER = process.env.REACT_APP_SIGNALING_SERVER || "https://webrtc-server-wwai.onrender.com";
 export default function App() {
   const [name, setName] = useState("");
   const [myId, setMyId] = useState("");
