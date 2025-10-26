@@ -72,7 +72,7 @@ export default function App() {
 
     // OFFER / ANSWER
     socket.on("offer", ({ from, signal, name: peerName }) => {
-      if (peersRef.current[from]) return; // prevent duplicates
+      if (peersRef.current[from]) return;
       const peer = new Peer({
         initiator: false,
         trickle: false,
@@ -107,10 +107,19 @@ export default function App() {
       if (peersRef.current[from]) peersRef.current[from].signal(signal);
     });
 
+    // --- CHAT ---
+    socket.off("receive-message");
     socket.on("receive-message", ({ from, name: fromName, msg }) => {
-      if (from !== socketId) setChat((prev) => [...prev, { from, fromName: fromName ?? from, msg }]);
+      if (from !== socketId) {
+        setChat(prev => {
+          const lastMsg = prev[prev.length - 1];
+          if (lastMsg && lastMsg.from === from && lastMsg.msg === msg) return prev;
+          return [...prev, { from, fromName: fromName ?? from, msg }];
+        });
+      }
     });
 
+    // --- VIDEO SYNC ---
     socket.on("receive-video", ({ url, action, time }) => {
       if (url && url !== sharedVideoUrl) setSharedVideoUrl(url);
       const player = playerRef.current;
@@ -130,7 +139,7 @@ export default function App() {
       Object.values(peersRef.current).forEach((p) => p.destroy());
       peersRef.current = {};
     };
-  }, [mediaStream]);
+  }, [mediaStream, sharedVideoUrl, socketId]);
 
   useEffect(() => {
     if (nameSet && name) socketRef.current?.emit("set-name", { name });
@@ -214,9 +223,12 @@ export default function App() {
     setTargetId("");
   };
 
+  // --- CHAT SEND ---
   const sendMessage = () => {
     if (!msg.trim()) return;
-    peers.forEach(p => socketRef.current?.emit("send-message", { to: p.id, msg, name: nameSet ? name : "" }));
+    peers.forEach(p =>
+      socketRef.current?.emit("send-message", { to: p.id, msg, name: nameSet ? name : "" })
+    );
     setChat(prev => [...prev, { from: socketId, fromName: "You", msg }]);
     setMsg("");
   };
@@ -235,9 +247,10 @@ export default function App() {
 
   const removePeer = (id) => socketRef.current.emit("remove-peer", { id });
 
+  // --- RENDER ---
   return (
     <div style={{ fontFamily: "Inter, sans-serif", display: "flex", flexDirection: "column", height: "100vh", width: "100vw", background: "#090d14", color: "#eee", overflow: "hidden" }}>
-      {/* Header */}
+      {/* HEADER */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 20px", background: "#121826", borderBottom: "1px solid #1e2536" }}>
         <div style={{ fontWeight: 700, fontSize: 28 }}>WatchApp</div>
         {nameSet ? (
@@ -250,9 +263,9 @@ export default function App() {
         )}
       </div>
 
-      {/* Main */}
+      {/* MAIN */}
       <div style={{ flex: 1, minHeight: 0, display: "flex", overflow: "hidden" }}>
-        {/* Video Player */}
+        {/* VIDEO PLAYER */}
         <div style={{ flex: "2 1 0%", minWidth: 0, display: "flex", flexDirection: "column", padding: 12, gap: 12 }}>
           <div style={{ display: "flex", gap: 8 }}>
             <input placeholder="Paste YouTube URL" value={videoUrl} onChange={(e) => setVideoUrl(e.target.value)} style={{ flex: 1, padding: "8px 12px", fontSize: 16, background: "#1a1f2c", color: "#eee", border: "1px solid #333", borderRadius: 8 }} />
@@ -265,15 +278,15 @@ export default function App() {
           </div>
         </div>
 
-        {/* Right Panel */}
+        {/* SIDE PANEL */}
         <div style={{ flex: "1 1 0%", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", justifyContent: "space-between", padding: 12, gap: 12 }}>
-          {/* Connect */}
+          {/* CONNECT */}
           <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
             <input placeholder="Enter socket ID" value={targetId} onChange={(e) => setTargetId(e.target.value.toUpperCase())} maxLength={5} style={{ padding: "8px 10px", background: "#23283c", border: "1px solid #2d364d", borderRadius: 7, color: "#eee", width: 170 }} />
             <button onClick={connectToFriend} style={{ background: "#4ade80", color: "#23283c", padding: "7px 20px", border: "none", borderRadius: 7, fontWeight: 700, cursor: "pointer" }}>Connect</button>
           </div>
 
-          {/* Peers List */}
+          {/* PEERS */}
           <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column", gap: 12, overflowY: "auto" }}>
             <div style={{ background: "#1a1f2c", borderRadius: 8, height: 120, display: "flex", alignItems: "center", gap: 20, padding: "0 16px" }}>
               <span style={{ fontWeight: 700, fontSize: 18 }}>{nameSet ? name : "You"}</span>
@@ -288,7 +301,24 @@ export default function App() {
             {peers.filter(p => p.id !== socketId).map(p => (
               <div key={p.id} style={{ background: "#292f42", borderRadius: 8, minHeight: 120, display: "flex", alignItems: "center", gap: 20, padding: "0 16px" }}>
                 <span style={{ fontWeight: 700 }}>{p.name || "Peer"}</span>
-                <video autoPlay playsInline muted={!p.micOn} style={{ width: 80, height: 80, background: "#000", borderRadius: 8, objectFit: "cover", display: p.camOn && peerStreams[p.id] ? "" : "none" }} ref={el => { if (el && peerStreams[p.id]) el.srcObject = peerStreams[p.id]; }} />
+                <video
+                  autoPlay
+                  playsInline
+                  muted={!p.micOn}
+                  style={{
+                    width: 80,
+                    height: 80,
+                    background: "#000",
+                    borderRadius: 8,
+                    objectFit: "cover",
+                    display: peerStreams[p.id] ? "" : "none"
+                  }}
+                  ref={el => {
+                    if (el && peerStreams[p.id] && el.srcObject !== peerStreams[p.id]) {
+                      el.srcObject = peerStreams[p.id];
+                    }
+                  }}
+                />
                 <div style={{ display: "flex", gap: 6 }}>
                   <span style={{ background: p.camOn ? "#16a34a" : "#b91c1c", padding: "4px 10px", borderRadius: 6, color: "#fff" }}>{p.camOn ? "Cam On" : "Cam Off"}</span>
                   <span style={{ background: p.micOn ? "#16a34a" : "#b91c1c", padding: "4px 10px", borderRadius: 6, color: "#fff" }}>{p.micOn ? "Mic On" : "Mic Off"}</span>
@@ -298,7 +328,7 @@ export default function App() {
             ))}
           </div>
 
-          {/* Chat */}
+          {/* CHAT */}
           <div style={{ background: "#111827", borderTop: "1px solid #1e2536", padding: 10 }}>
             <div style={{ height: 140, overflowY: "auto", background: "#0f1729", marginBottom: 8, padding: 8, borderRadius: 8 }}>
               {chat.map((c, i) => (
