@@ -36,31 +36,23 @@ export default function App() {
 
   // Socket & Peer connections
   useEffect(() => {
-    const socket = io(SIGNALING_SERVER, { transports: ["websocket"] });
-    socketRef.current = socket;
+  console.log("Connecting to socket once on mount");
+  
+  const socket = io(SIGNALING_SERVER, { transports: ["websocket"] });
+  socketRef.current = socket;
 
-    // --- Basic socket events ---
-    socket.on("connect-success", ({ id }) => {
-      setSocketId(id);
-      socket.emit("get-host");
-    });
+  socket.on("connect-success", ({ id }) => {
+    setSocketId(id);
+    socket.emit("get-host");
+  });
 
-    socket.on("host", ({ id }) => setHostId(id));
+  // All other socket.on handlers go here unchanged
 
-    socket.on("update-peers", (peerList) => setPeers(peerList));
-
-    socket.on("peer-updated", (peer) =>
-      setPeers((prev) =>
-        prev.map((p) => (p.id === peer.id ? { ...p, ...peer } : p))
-      )
-    );
-    socket.on("peer-left", ({ id }) => {
-      setPeers((prev) => prev.filter((p) => p.id !== id));
-      setPeerStreams((prev) => {
-        const { [id]: gone, ...rest } = prev;
-        return rest;
-      });
-    });
+  return () => {
+    console.log("Disconnecting socket on unmount");
+    socket.disconnect();
+    };
+    }, []); // <-- empty array ensures single initialization only
 
     // --- Peer-to-Peer (WebRTC via simple-peer) ---
     socket.on("offer", ({ from, signal, name: peerName }) => {
