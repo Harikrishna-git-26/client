@@ -21,7 +21,9 @@ export default function App() {
   useEffect(() => {
     const socket = io(SIGNALING_SERVER, { transports: ["websocket"] });
     socketRef.current = socket;
-    socket.on("connect", () => setSocketId(socket.id));
+    socket.on("connect-success", ({ id }) => {
+      setSocketId(id);
+        });
 
     socket.on("new-connection", (id) => {
       setConnectedIds((prev) => [...new Set([...prev, id])]);
