@@ -1,57 +1,91 @@
-import React, { useEffect, useRef, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import io from "socket.io-client";
+import Peer from "simple-peer";
 import ReactPlayer from "react-player";
 
 const SIGNALING_SERVER =
   process.env.REACT_APP_SIGNALING_SERVER ||
-  "https://webrtc-server-wwai.onrender.com"; // use your actual deployed backend
+  "https://webrtc-server-wwai.onrender.com"; // update with your deployed backend
 
 export default function App() {
-  const playerRef = useRef();
-  const socketRef = useRef();
+  const playerRef = useRef(null);
+  const myVideoRef = useRef(null);
+  const socketRef = useRef(null);
 
   const [name, setName] = useState("");
   const [nameSet, setNameSet] = useState(false);
   const [socketId, setSocketId] = useState("");
   const [hostId, setHostId] = useState("");
   const [targetId, setTargetId] = useState("");
-  const [peers, setPeers] = useState([]);
-  const [meStatus, setMeStatus] = useState({ camOn: true, micOn: true });
+  const [peers, setPeers] = useState([]); // { id, name, camOn, micOn, streamId }
+  const [peerStreams, setPeerStreams] = useState({});
+  const [meStatus, setMeStatus] = useState({ camOn: false, micOn: false });
+  const [stream, setStream] = useState(null);
+
   const [videoUrl, setVideoUrl] = useState("");
   const [sharedVideoUrl, setSharedVideoUrl] = useState("");
   const [chat, setChat] = useState([]);
   const [msg, setMsg] = useState("");
 
-  // Initialize socket only once
+  // Responsive, scroll-less
+  useEffect(() => {
+    document.body.style.margin = "0";
+    document.body.style.padding = "0";
+    document.body.style.overflow = "hidden";
+  }, []);
+
+  // Socket & Peer connections
   useEffect(() => {
     const socket = io(SIGNALING_SERVER, { transports: ["websocket"] });
     socketRef.current = socket;
 
+    // --- Basic socket events ---
     socket.on("connect-success", ({ id }) => {
       setSocketId(id);
       socket.emit("get-host");
     });
 
     socket.on("host", ({ id }) => setHostId(id));
+
     socket.on("update-peers", (peerList) => setPeers(peerList));
-    socket.on("peer-joined", (peer) =>
-      setPeers((prev) => [...prev.filter((p) => p.id !== peer.id), peer])
-    );
-    socket.on("peer-left", ({ id }) =>
-      setPeers((prev) => prev.filter((p) => p.id !== id))
-    );
+
     socket.on("peer-updated", (peer) =>
       setPeers((prev) =>
         prev.map((p) => (p.id === peer.id ? { ...p, ...peer } : p))
       )
     );
-
-    socket.on("new-connection", () => {
-      socket.emit("request-peers");
+    socket.on("peer-left", ({ id }) => {
+      setPeers((prev) => prev.filter((p) => p.id !== id));
+      setPeerStreams((prev) => {
+        const { [id]: gone, ...rest } = prev;
+        return rest;
+      });
     });
 
-    socket.on("receive-message", ({ from, msg }) => {
-      setChat((prev) => [...prev, { from, msg }]);
+    // --- Peer-to-Peer (WebRTC via simple-peer) ---
+    socket.on("offer", ({ from, signal, name: peerName }) => {
+      const peer = new Peer({ initiator: false, trickle: false, stream });
+      peer.on("signal", (signal) => {
+        socket.emit("answer", { to: from, signal });
+      });
+      peer.on("stream", (remoteStream) => {
+        setPeerStreams((prev) => ({ ...prev, [from]: remoteStream }));
+      });
+      peer.signal(signal);
+    });
+
+    socket.on("answer", ({ from, signal }) => {
+      if (window.peers && window.peers[from]) {
+        window.peers[from].signal(signal);
+      }
+    });
+
+    // --- Chat & YouTube sync ---
+    socket.on("receive-message", ({ from, name: fromName, msg }) => {
+      setChat((prev) => [
+        ...prev,
+        { from, fromName: fromName ?? from, msg },
+      ]);
     });
 
     socket.on("receive-video", ({ url, action, time }) => {
@@ -64,19 +98,68 @@ export default function App() {
       }
     });
 
-    socket.on("remove-peer", ({ id }) => {
-      if (id === socketId) window.location.reload();
-    });
+    // Ask for camera/mic on connection if desired
+    // comment this out if want manual control only
+    // startCamMic();
 
     return () => socket.disconnect();
-  }, []); // ← keeps it constant
+  }, [stream, sharedVideoUrl, socketId]);
 
-  // Set name once entered
+  // Name handling
   useEffect(() => {
     if (nameSet && name) {
       socketRef.current?.emit("set-name", { name });
     }
   }, [nameSet, name]);
+
+  // Helper: Start cam/mic
+  const startCamMic = () => {
+    navigator.mediaDevices
+      .getUserMedia({
+        video: true,
+        audio: true,
+      })
+      .then((mediaStream) => {
+        setStream(mediaStream);
+        setMeStatus({ camOn: true, micOn: true });
+        if (myVideoRef.current) {
+          myVideoRef.current.srcObject = mediaStream;
+        }
+        // initiate signaling to any peers
+        (peers || []).forEach((p) => callPeer(p.id, mediaStream));
+      });
+  };
+
+  const stopCamMic = () => {
+    setMeStatus({ camOn: false, micOn: false });
+    if (myVideoRef.current && myVideoRef.current.srcObject) {
+      myVideoRef.current.srcObject.getTracks().forEach((t) => t.stop());
+      myVideoRef.current.srcObject = null;
+    }
+    setStream(null);
+  };
+
+  // Call a peer (WebRTC) as initiator
+  const callPeer = (targetId, mediaStream) => {
+    if (!mediaStream) return;
+    if (!window.peers) window.peers = {};
+    const peer = new Peer({
+      initiator: true,
+      trickle: false,
+      stream: mediaStream,
+    });
+    peer.on("signal", (signal) => {
+      socketRef.current.emit("offer", {
+        to: targetId,
+        signal,
+        name,
+      });
+    });
+    peer.on("stream", (remoteStream) => {
+      setPeerStreams((prev) => ({ ...prev, [targetId]: remoteStream }));
+    });
+    window.peers[targetId] = peer;
+  };
 
   const handleNameEnter = (e) => {
     if (e.key === "Enter" && name.trim()) setNameSet(true);
@@ -88,66 +171,58 @@ export default function App() {
     setTargetId("");
   };
 
+  // Chat send
+  const sendMessage = () => {
+    if (!msg.trim()) return;
+    // Send with from, name
+    (peers || []).forEach((p) =>
+      socketRef.current?.emit("send-message", {
+        to: p.id,
+        msg,
+        name: nameSet ? name : "",
+      })
+    );
+    setChat((prev) => [...prev, { from: socketId, fromName: "You", msg }]);
+    setMsg("");
+  };
+
+  // YouTube actions
   const shareVideo = () => {
     if (!videoUrl.trim()) return;
-    peers.forEach((p) =>
+    (peers || []).forEach((p) =>
       socketRef.current?.emit("send-video", { to: p.id, url: videoUrl })
     );
     setSharedVideoUrl(videoUrl);
     setVideoUrl("");
   };
 
-  const sendMessage = () => {
-    if (!msg.trim()) return;
-    peers.forEach((p) =>
-      socketRef.current?.emit("send-message", { to: p.id, msg })
-    );
-    setChat((prev) => [...prev, { from: "You", msg }]);
-    setMsg("");
-  };
-
   const broadcastAction = (action) => {
     const time = playerRef.current.getCurrentTime();
-    peers.forEach((p) =>
+    (peers || []).forEach((p) =>
       socketRef.current?.emit("send-video", { to: p.id, action, time })
     );
   };
 
-  const toggleMe = useCallback(
-    (what) => {
-      setMeStatus((prev) => {
-        const next = { ...prev, [what]: !prev[what] };
-        socketRef.current.emit("update-status", next);
-        return next;
-      });
-    },
-    [setMeStatus]
-  );
-
-  const leave = () => {
-    socketRef.current.emit("leave");
-    window.location.reload();
-  };
-
-  const removePeer = (id) => {
-    socketRef.current.emit("remove-peer", { id });
+  // Responsive fix: fill all available viewport
+  const outerStyle = {
+    fontFamily: "Inter, sans-serif",
+    display: "flex",
+    flexDirection: "column",
+    height: "100vh",
+    width: "100vw",
+    boxSizing: "border-box",
+    background: "#090d14",
+    color: "#eee",
+    overflow: "hidden",
   };
 
   return (
-    <div
-      style={{
-        fontFamily: "Inter, sans-serif",
-        display: "flex",
-        flexDirection: "column",
-        height: "100vh",
-        background: "#090d14",
-        color: "#eee",
-      }}
-    >
-      {/* Header */}
+    <div style={outerStyle}>
+      {/* Top bar */}
       <div
         style={{
           display: "flex",
+          flexShrink: 0,
           justifyContent: "space-between",
           alignItems: "center",
           padding: "10px 20px",
@@ -191,31 +266,40 @@ export default function App() {
         )}
       </div>
 
-      {/* Main Content */}
-      <div style={{ flex: 1, display: "flex" }}>
-        {/* Left: Video */}
+      {/* Layout: video left, controls/chat right */}
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          display: "flex",
+        }}
+      >
+        {/* Left: YouTube video and webcam local preview */}
         <div
           style={{
             flex: "2 1 0%",
-            padding: 16,
+            minWidth: 0,
             display: "flex",
             flexDirection: "column",
-            borderRight: "1px solid #1e2536",
+            padding: 12,
+            gap: 12,
           }}
         >
-          <div style={{ display: "flex", marginBottom: 10, gap: 8 }}>
+          {/* YouTube URL input */}
+          <div style={{ display: "flex", gap: 8 }}>
             <input
-              placeholder="Paste YouTube URL"
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
               style={{
                 flex: 1,
                 padding: "8px 12px",
+                fontSize: 16,
                 background: "#1a1f2c",
+                color: "#eee",
                 border: "1px solid #333",
                 borderRadius: 8,
-                color: "#eee",
               }}
+              placeholder="Paste YouTube URL"
+              value={videoUrl}
+              onChange={(e) => setVideoUrl(e.target.value)}
             />
             <button
               onClick={shareVideo}
@@ -223,7 +307,7 @@ export default function App() {
                 background: "#2563eb",
                 border: "none",
                 color: "#fff",
-                padding: "8px 16px",
+                padding: "8px 18px",
                 borderRadius: 8,
                 cursor: "pointer",
               }}
@@ -231,17 +315,7 @@ export default function App() {
               Share
             </button>
           </div>
-          <div
-            style={{
-              background: "#000",
-              flex: 1,
-              borderRadius: 8,
-              overflow: "hidden",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-            }}
-          >
+          <div style={{ flex: 1, minHeight: 0, background: "#000", borderRadius: 8, position: "relative" }}>
             {sharedVideoUrl ? (
               <ReactPlayer
                 ref={playerRef}
@@ -249,27 +323,33 @@ export default function App() {
                 controls
                 width="100%"
                 height="100%"
+                muted
+                playing // auto-play active
+                style={{ position: "absolute", width: "100%", height: "100%", top: 0, left: 0 }}
                 onPlay={() => broadcastAction("PLAY")}
                 onPause={() => broadcastAction("PAUSE")}
-                onSeek={(t) => broadcastAction("SEEK", t)}
+                onSeek={t => broadcastAction("SEEK", t)}
               />
             ) : (
-              <span style={{ opacity: 0.6 }}>No video shared yet</span>
+              <span style={{ opacity: 0.6, padding: 20 }}>No video shared yet</span>
             )}
           </div>
         </div>
-
-        {/* Right side */}
+        {/* Right: video tiles, cam/mic controls, chat */}
         <div
           style={{
             flex: "1 1 0%",
+            minWidth: 0,
+            minHeight: 0,
             display: "flex",
             flexDirection: "column",
             justifyContent: "space-between",
+            padding: 12,
+            gap: 12,
           }}
         >
-          {/* Connect field */}
-          <div style={{ margin: "14px 0 0 14px", display: "flex", gap: 8 }}>
+          {/* Connect to peer */}
+          <div style={{ display: "flex", gap: 8 }}>
             <input
               placeholder="Enter socket ID"
               value={targetId}
@@ -299,37 +379,42 @@ export default function App() {
               Connect
             </button>
           </div>
-
-          {/* Peers section */}
-          <div
-            style={{
-              flex: 1,
-              padding: 16,
-              overflowY: "auto",
+          {/* Video tiles */}
+          <div style={{
+            flex: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: 12,
+            overflowY: "auto",
+          }}>
+            {/* My webcam preview */}
+            <div style={{
+              background: "#1a1f2c",
+              borderRadius: 8,
+              height: 120,
               display: "flex",
-              flexDirection: "column",
-              gap: 14,
-            }}
-          >
-            {/* Me */}
-            <div
-              style={{
-                background: "#1a1f2c",
-                borderRadius: 8,
-                height: 100,
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "space-between",
-                border: "1px solid #2f3649",
-                padding: "0 22px",
-              }}
-            >
-              <span style={{ fontWeight: 700, fontSize: 18 }}>
-                {nameSet ? name : "Me"}
-              </span>
-              <div style={{ display: "flex", gap: 10 }}>
+              alignItems: "center",
+              gap: 20,
+              padding: "0 16px",
+            }}>
+              <span style={{ fontWeight: 700, fontSize: 18 }}>{nameSet ? name : "You"}</span>
+              <video
+                ref={myVideoRef}
+                autoPlay
+                muted
+                playsInline
+                style={{
+                  width: 80,
+                  height: 80,
+                  background: "#000",
+                  borderRadius: 8,
+                  objectFit: "cover",
+                  display: meStatus.camOn ? "" : "none"
+                }}
+              />
+              <div style={{ display: "flex", gap: 6 }}>
                 <button
-                  onClick={() => toggleMe("camOn")}
                   style={{
                     background: meStatus.camOn ? "#34d399" : "#dc2626",
                     color: "#23283c",
@@ -337,11 +422,14 @@ export default function App() {
                     borderRadius: 5,
                     padding: "4px 10px",
                   }}
+                  onClick={() => {
+                    if (!meStatus.camOn) startCamMic();
+                    else stopCamMic();
+                  }}
                 >
                   {meStatus.camOn ? "Cam On" : "Cam Off"}
                 </button>
                 <button
-                  onClick={() => toggleMe("micOn")}
                   style={{
                     background: meStatus.micOn ? "#34d399" : "#dc2626",
                     color: "#23283c",
@@ -349,24 +437,19 @@ export default function App() {
                     borderRadius: 5,
                     padding: "4px 10px",
                   }}
+                  onClick={() => setMeStatus(s => {
+                    // Toggle local mic (future: manage audio tracks)
+                    if (stream) {
+                      stream.getAudioTracks().forEach(t => t.enabled = !s.micOn);
+                    }
+                    return { ...s, micOn: !s.micOn };
+                  })}
                 >
                   {meStatus.micOn ? "Mic On" : "Mic Off"}
                 </button>
-                <button
-                  onClick={leave}
-                  style={{
-                    color: "#dc2626",
-                    background: "#1f2937",
-                    border: "1px solid #a8a8a8",
-                    borderRadius: 8,
-                    padding: "4px 8px",
-                  }}
-                >
-                  Leave
-                </button>
               </div>
             </div>
-            {/* Peer list */}
+            {/* Peers */}
             {peers
               .filter((p) => p.id !== socketId)
               .map((p) => (
@@ -375,60 +458,55 @@ export default function App() {
                   style={{
                     background: "#292f42",
                     borderRadius: 8,
-                    height: 100,
+                    minHeight: 120,
                     display: "flex",
                     alignItems: "center",
-                    justifyContent: "space-between",
-                    border: "1px solid #2f3649",
-                    padding: "0 22px",
+                    gap: 20,
+                    padding: "0 16px",
                   }}
                 >
                   <span style={{ fontWeight: 700 }}>{p.name || "Peer"}</span>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <span
-                      style={{
-                        padding: "4px 11px",
-                        borderRadius: 9,
-                        background: p.camOn ? "#16a34a" : "#b91c1c",
-                      }}
-                    >
-                      {p.camOn ? "Cam On" : "Cam Off"}
-                    </span>
-                    <span
-                      style={{
-                        padding: "4px 11px",
-                        borderRadius: 9,
-                        background: p.micOn ? "#16a34a" : "#b91c1c",
-                      }}
-                    >
-                      {p.micOn ? "Mic On" : "Mic Off"}
-                    </span>
-                    {hostId === socketId ? (
-                      <button
-                        onClick={() => removePeer(p.id)}
-                        style={{
-                          color: "#dc2626",
-                          background: "#fff",
-                          border: "1px solid #dc2626",
-                          borderRadius: 8,
-                          padding: "4px 12px",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Remove
-                      </button>
-                    ) : null}
+                  <video
+                    autoPlay
+                    playsInline
+                    muted={!p.micOn}
+                    style={{
+                      width: 80,
+                      height: 80,
+                      background: "#000",
+                      borderRadius: 8,
+                      objectFit: "cover",
+                      display: p.camOn && peerStreams[p.id] ? "" : "none"
+                    }}
+                    ref={el => {
+                      if (el && peerStreams[p.id]) {
+                        el.srcObject = peerStreams[p.id];
+                      }
+                    }}
+                  />
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <span style={{
+                      background: p.camOn ? "#16a34a" : "#b91c1c",
+                      padding: "4px 10px",
+                      borderRadius: 6,
+                      color: "#fff",
+                    }}>{p.camOn ? "Cam On" : "Cam Off"}</span>
+                    <span style={{
+                      background: p.micOn ? "#16a34a" : "#b91c1c",
+                      padding: "4px 10px",
+                      borderRadius: 6,
+                      color: "#fff"
+                    }}>{p.micOn ? "Mic On" : "Mic Off"}</span>
                   </div>
                 </div>
               ))}
           </div>
-
           {/* Chat */}
           <div
             style={{
               background: "#111827",
               borderTop: "1px solid #1e2536",
-              padding: 12,
+              padding: 10,
             }}
           >
             <div
@@ -443,7 +521,9 @@ export default function App() {
             >
               {chat.map((c, i) => (
                 <div key={i}>
-                  <strong>{c.from}: </strong>{c.msg}
+                  <strong>
+                    {c.from === socketId ? "You" : c.fromName || c.from}:
+                  </strong> {c.msg}
                 </div>
               ))}
             </div>
