@@ -78,14 +78,13 @@ export default function App() {
 
     // Chat: Deduplicate by filtering self
     if (!socket) return;
-  const handler = ({ from, name: fromName, msg }) => {
+      const handler = ({ from, name: fromName, msg }) => {
     if (from !== socketId) {
       setChat((prev) => [...prev, { from, fromName: fromName ?? from, msg }]);
-    }
-    };
+    }}
     socket.on("receive-message", handler);
     return () => socket.off("receive-message", handler);
-    }, [socketId]);
+
     // YouTube video sync
     socket.on("receive-video", ({ url, action, time }) => {
       if (url && url !== sharedVideoUrl) setSharedVideoUrl(url);
@@ -107,7 +106,7 @@ export default function App() {
       Object.values(peersRef.current).forEach((p) => p.destroy());
       peersRef.current = {};
     };
-  }, []);
+  }, [socketId]);
 
   useEffect(() => {
     if (nameSet && name) {
